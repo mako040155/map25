@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>スポット＆ルート記録マップ</title>
+  <style>
+    #map, #streetview { width: 100%; height: 500px; }
+    #memoList, #routeList { margin-top: 10px; display: none; }
+    .memoItem { border: 1px solid #ccc; padding: 5px; margin-bottom: 5px; cursor: pointer; }
+    #previewImage { max-width: 200px; display: none; margin-top: 5px; }
+  </style>
+</head>
+<body>
+  <h2>スポット＆ルート記録マップ</h2>
+  <div>
+    <select id="mapTypeSelector" onchange="changeMapType()">
+      <option value="roadmap">通常地図</option>
+      <option value="satellite">航空写真</option>
+      <option value="hybrid">ハイブリッド</option>
+      <option value="terrain">地形</option>
+    </select>
+    <select id="categoryFilter" onchange="renderMemoList()"></select>
+    <button onclick="setMode('view')">閲覧モード</button>
+    <button onclick="setMode('edit')">編集モード</button>
+    <button onclick="showMemoList()">メモ一覧を表示</button>
+    <button onclick="showRouteList()">ルート一覧を表示</button>
+    <button onclick="showCurrentLocation()">現在地を表示</button>
+    <button onclick="startTracking()">ルート記録開始</button>
+    <button onclick="stopTracking()">ルート記録停止・保存</button>
+    <button id="exitStreetViewBtn" onclick="exitStreetView()" style="display:none;">地図に戻す</button>
+  </div>
+
+  <select id="categoryFilter" onchange="renderMemoList()" style="display:none;">
+  </div>
+
+  </select>
+
+  <div id="map"></div>
+
+  <h3 id="memoTitle" style="display:none;">メモ一覧</h3>
+  <div id="memoList"></div>
+  
+  <button id="editCategoryBtn" style="display:none;">カテゴリ編集</button>
+
+  <h3 id="routeTitle" style="display:none;">ルート一覧</h3>
+  <div id="routeList"></div>
+
+  <script>
+    const routeColors = ["#FF0000", "#0000FF", "#00AA00", "#FF00FF", "#00FFFF", "#FFA500"];
+    let displayedPolylines = [];
+    let map, route = [], watchId = null, currentLocationMarker = null, spotMemos = [];
+    let currentMode = "view";
+
+    const defaultIcons = [
+      "http://maps.google.com/mapfiles/ms/icons/red-dot.png",
+      "http://maps.google.com/mapfiles/ms/icons/green-dot.png",
+      "http://maps.google.com/mapfiles/ms/icons/yellow-dot.png",
+      "http://maps.google.com/mapfiles/ms/icons/blue-dot.png",
+      "http://maps.google.com/mapfiles/ms/icons/purple-dot.png"
+    ];
+
+    const categories = [
+      { name: "危険", icon: defaultIcons[0] },
+      { name: "おすすめ", icon: defaultIcons[1] },
+      { name: "注意", icon: defaultIcons[2] }
+    ];
+
+    function initMap() {
+      map = new google.maps.Map(document.getElementById("map"), {
+        center: { lat: 35.946, lng: 136.184 },
+        zoom: 15,
+        mapTypeId: "roadmap"
+      });
+
+      updateCategoryFilter();
+      loadSpotMemos();
+      updateRouteList();
+
+      map.addListener("click", (e) => {
+        if (currentMode !== "edit") return;
+        const latLng = e.latLng;
+        const point = { lat: latLng.lat(), lng: latLng.lng(), memo: "", image: "", category: "" };
+        const marker = new google.maps.Marker({ position: { lat: point.lat, lng: point.lng }, map: map });
+        const infoWindow = new google.maps.InfoWindow();
+        showInputForm(point, infoWindow, marker, true);
+      });
+
+      document.getElementById("editCategoryBtn").onclick = () => {
+        showCategoryEditor();
+      };
+
+      function updateCategoryFilter() {
+        const select = document.getElementById("categoryFilter");
+        select.innerHTML = "";
+        
+        const allOption = document.createElement("option");
+        allOption.value = "すべて";
+        allOption.textContent = "すべて表示";
+        select.appendChild(allOption);
+        
+        categories.forEach(c => {
+            const option = document.createElement("option");
+            option.value = c.name;
+            option.textContent = c.name;
+            select.appendChild(option);
+        });
+      }
+    }
+
+    function filterPinsByCategory(categoryName) {
+        spotMemos.forEach(({ point, marker }) => {
+            if (categoryName === "すべて" || point.category === categoryName) {
+                marker.setMap(map); 
+            } else {
+                marker.setMap(null); 
+            }
+        });
+    }
+
+    function setMode(mode) {
+      currentMode = mode;
+      alert(mode === "edit" ? "編集モードになりました" : "閲覧モードになりました");
+    }
+
+    function changeMapType() {
+      const type = document.getElementById("mapTypeSelector").value;
+      map.setMapTypeId(type);
+    }
+
+    function showMemoList() {
+      document.getElementById("memoList").style.display = "block";
+      document.getElementById("memoTitle").style.display = "block";
+      document.getElementById("categoryFilter").style.display = "inline";
+      document.getElementById("editCategoryBtn").style.display = "inline";
+      document.getElementById("routeList").style.display = "none";
+      document.getElementById("routeTitle").style.display = "none";
+      renderMemoList();
+    }
+
+    function showRoute(index) {
+      document.getElementById("memoTitle").style.display = "none";
+      document.getElementById("memoList").style.display = "none";
+      document.getElementById("categoryFilter").style.display = "none";
+      document.getElementById("editCategoryBtn").style.display = "none"; 
+      document.getElementById("routeTitle").style.display = "block";
+      document.getElementById("routeList").style.display = "block";
+      
+      const routes = JSON.parse(localStorage.getItem("routes")) || [];
+      const route = routes[index];
+      if (!route || !route.points || route.points.length === 0) return;
+
+      const color = routeColors[index % routeColors.length];
+      const polyline = new google.maps.Polyline({
+        path: route.points,
+        map: map,
+        strokeColor: color,
+        strokeOpacity: 0.8,
+        strokeWeight: 4
+      });
+
+      displayedPolylines[index] = polyline;
+
+      let totalDistance = 0;
+      for (let i = 1; i < route.points.length; i++) {
+        const p1 = new google.maps.LatLng(route.points[i - 1]);
+        const p2 = new google.maps.LatLng(route.points[i]);
+        totalDistance += google.maps.geometry.spherical.computeDistanceBetween(p1, p2);
+      }
+      alert(`ルート「${route.name}」の距離: ${(totalDistance / 1000).toFixed(2)} km`);
+      map.setCenter(route.points[0]);
+    }
+
+    function hideRoute(index) {
+      if (displayedPolylines[index]) {
+        displayedPolylines[index].setMap(null);
+        displayedPolylines[index] = null;
+      }
+    }
+
+    function showCurrentLocation() {
+      if (!navigator.geolocation) {
+        alert("現在地情報を取得できません");
+        return;
+      }
+      navigator.geolocation.getCurrentPosition(pos => {
+        const latLng = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+        map.setCenter(latLng);
+        if (currentLocationMarker) {
+          currentLocationMarker.setPosition(latLng);
+        } else {
+          currentLocationMarker = new google.maps.Marker({
+            position: latLng,
+            map: map,
+            icon: defaultIcons[3]
+          });
+        }
+      }, () => alert("現在地の取得に失敗しました"));
+    }
+
+    function updateCategoryFilter() {
+      const filter = document.getElementById("categoryFilter");
+      filter.innerHTML = '<option value="すべて">すべて表示</option>';
+      categories.forEach(c => {
+        const option = document.createElement("option");
+        option.value = c.name;
+        option.textContent = c.name;
+        filter.appendChild(option);
+      });
+    }
+    
+    function finalizeSpotMemo(point, marker) {
+        const existing = spotMemos.find(p =>
+          Math.abs(p.point.lat - point.lat) < 0.000001 &&
+          Math.abs(p.point.lng - point.lng) < 0.000001
+        );
+        
+        if (existing) {
+            existing.point = point;
+            existing.marker = marker;
+        } else {
+            spotMemos.push({ point, marker });
+        }
+        saveSpotMemos();
+        alert("保存しました");
+    }
+    
+    function saveSpotMemos() {
+        const data = spotMemos.map(({ point }) => ({
+            lat: point.lat,
+            lng: point.lng,
+            memo: point.memo,
+            image: point.image,
+            category: point.category
+        }));
+        localStorage.setItem("spotMemos", JSON.stringify(data));
+        renderMemoList();
+    }
+
+    function loadSpotMemos() {
+      const saved = JSON.parse(localStorage.getItem("spotMemos")) || [];
+      spotMemos = [];
+      saved.forEach(point => {
+        if (typeof point.lat !== "number" || typeof point.lng !== "number") return;
+        const category = categories.find(c => c.name === point.category);
+        const marker = new google.maps.Marker({
+          position: { lat: point.lat, lng: point.lng },
+          map: map,
+          icon: category ? category.icon : defaultIcons[0]
+        });
+        const infoWindow = new google.maps.InfoWindow();
+        updateInfoWindow(point, infoWindow, marker);
+        marker.addListener("click", () => showInputForm(point, infoWindow, marker, false));
+        spotMemos.push({ point, marker });
+      });
+      renderMemoList();
+    }
+    function updateInfoWindow(point, infoWindow, marker) {
+      let content = `<strong>カテゴリ:</strong> ${point.category || "（未設定）"}<br>`;
+      content += `<strong>メモ:</strong> ${point.memo || "（なし）"}`;
+      if (point.image) content += `<br><img src="${point.image}" width="200">`;
+      infoWindow.setContent(content);
+    }
+
+    function deleteSpotMemo(lat, lng) {
+      spotMemos = spotMemos.filter(({ point, marker }) => {
+        const match = Math.abs(point.lat - lat) < 0.000001 && Math.abs(point.lng - lng) < 0.000001;
+        if (match && marker) marker.setMap(null);
+        return !match;
+      });
+      saveSpotMemos();
+    }
+
+
+    function renderMemoList() {
+        
+        const container = document.getElementById("memoList");
+        container.innerHTML = "";
+
+        const selectedCategory = document.getElementById("categoryFilter").value;
+        filterPinsByCategory(selectedCategory);
+
+        spotMemos.forEach(({ point, marker }) => {
+            if (selectedCategory === "すべて" || point.category === selectedCategory) {
+                const item = document.createElement("div");
+                item.className = "memo-item";
+                item.innerHTML = `
+                <span>カテゴリ: ${point.category}</span><br>
+                <span>メモ: ${point.memo}</span><br>
+                <button class="editMemoBtn" data-lat="${point.lat}" data-lng="${point.lng}">編集</button> `;
+                container.appendChild(item);
+            }
+        });
+
+        // 編集ボタンのイベント設定
+        document.querySelectorAll(".editMemoBtn").forEach(btn => {
+ 
+            btn.onclick = () => {
+                const lat = parseFloat(btn.dataset.lat);
+                const lng = parseFloat(btn.dataset.lng);
+                const target = spotMemos.find(p =>
+                Math.abs(p.point.lat - lat) < 0.000001 &&
+                Math.abs(p.point.lng - lng) < 0.000001
+            );
+            if (target) {
+                const infoWindow = new google.maps.InfoWindow();
+                showInputForm(target.point, infoWindow, target.marker, false); 
+            }
+        };
+        });
+    }
+
+    filtered.forEach(({ point, marker }) => {
+        const item = document.createElement("div");
+        item.className = "memoItem";
+        item.innerHTML = `
+          <strong>カテゴリ:</strong> ${point.category || "（未設定）"}<br>
+          <strong>メモ:</strong> ${point.memo || "（なし）"}<br>
+          ${point.image ? `<img src="${point.image}" width="100"><br>` : ""}
+        `;
+        item.onclick = () => {
+          map.setCenter({ lat: point.lat, lng: point.lng });
+          google.maps.event.trigger(marker, "click");
+        };
+        container.appendChild(item);});
+    
+
+    function showInputForm(point, infoWindow, marker, isNew = false) {
+      const container = document.createElement("div");
+      container.innerHTML = `
+        <label>カテゴリ:<br><select id="inputCategory">
+          ${categories.map(c => `<option value="${c.name}">${c.name}</option>`).join("")}
+        </select></label><br>
+        <label>メモ:<br><textarea id="inputMemo" rows="3" cols="30">${point.memo || ""}</textarea></label><br>
+        <label>画像:<br>
+          <input type="file" id="inputImage" accept="image/*"><br>
+          <img id="previewImage" src="${point.image || ""}" style="max-width:200px; ${point.image ? "display:block;" : "display:none;"}">
+        </label><br>
+        <button id="saveBtn">保存</button>
+        ${!isNew ? `<button id="updateBtn">変更</button>` : ""}
+        <button id="deleteBtn">削除</button>
+      `;
+      infoWindow.setContent(container);
+      infoWindow.open(map, marker);
+      
+      google.maps.event.addListenerOnce(infoWindow, "domready", () => {
+        document.getElementById("inputCategory").value = point.category || "";
+        
+        document.getElementById("saveBtn").onclick = () => {
+            console.log("保存ボタンが押されました");
+            const lat = point.lat;
+            const lng = point.lng;
+            
+            point.category = document.getElementById("inputCategory").value;
+            point.memo = document.getElementById("inputMemo").value;
+            const file = document.getElementById("inputImage").files[0];
+            const categoryObj = categories.find(c => c.name === point.category);
+            marker.setIcon(categoryObj ? categoryObj.icon : defaultIcons[0]);
+            
+            const finalize = () => {
+                point.lat = lat;
+                point.lng = lng;
+                finalizeSpotMemo(point, marker);
+                infoWindow.close();
+            };
+            
+            if (file) {
+                const reader = new FileReader();
+                reader.onload = () => { point.image = reader.result; finalize(); };
+                reader.readAsDataURL(file);
+            } else {
+                finalize();
+            }
+        };
+        
+        //更新ボタン
+      if (!isNew) {
+        document.getElementById("updateBtn").onclick = () => {
+          point.category = document.getElementById("inputCategory").value;
+          point.memo = document.getElementById("inputMemo").value;
+          const file = document.getElementById("inputImage").files[0];
+          const categoryObj = categories.find(c => c.name === point.category);
+          marker.setIcon(categoryObj ? categoryObj.icon : defaultIcons[0]);
+
+          const update = () => {
+            const target = spotMemos.find(p =>
+              Math.abs(p.point.lat - point.lat) < 0.000001 &&
+              Math.abs(p.point.lng - point.lng) < 0.000001
+            );
+            if (target) {
+              target.point = point;
+              target.marker = marker;
+            }
+            saveSpotMemos();
+            updateInfoWindow(point, infoWindow, marker);
+          };
+
+          if (file) {
+            const reader = new FileReader();
+            reader.onload = () => { point.image = reader.result; update(); };
+            reader.readAsDataURL(file);
+          } else {
+            update();
+          }};
+        }
+        
+        //削除ボタン
+        document.getElementById("deleteBtn").onclick = () => {
+            deleteSpotMemo(point.lat, point.lng);
+            infoWindow.close();
+        };
+        
+        //画像プレビュー
+        document.getElementById("inputImage").addEventListener("change", function () {
+            const file = this.files[0];
+            const preview = document.getElementById("previewImage");
+            if (file) {
+                const reader = new FileReader();
+                reader.onload = function (e) {
+                    preview.src = e.target.result;
+                    preview.style.display = "block";
+                };
+                reader.readAsDataURL(file);
+            } else {
+                preview.src = "";
+                preview.style.display = "none";
+            }
+        });
+    });
+    }
+
+    function startTracking() {
+      if (watchId) return;
+      route = [];
+      watchId = navigator.geolocation.watchPosition(pos => {
+        const latLng = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+        route.push(latLng);
+
+        if (currentLocationMarker) {
+          currentLocationMarker.setPosition(latLng);
+        } else {
+          currentLocationMarker = new google.maps.Marker({
+            position: latLng,
+            map: map,
+            icon: defaultIcons[3]
+          });
+        }
+
+        map.setCenter(latLng);
+      });
+    }
+
+    function stopTracking() {
+      if (watchId) {
+        navigator.geolocation.clearWatch(watchId);
+        watchId = null;
+      }
+
+      if (route.length > 0) {
+        const name = prompt("ルート名を入力してください");
+        const description = prompt("説明を入力してください");
+        if (name && description) {
+          saveRoute(name, description, route);
+        }
+      }
+    }
+
+    function saveRoute(name, description, points) {
+      const routeData = { name, description, points };
+      const routes = JSON.parse(localStorage.getItem("routes")) || [];
+      routes.push(routeData);
+      localStorage.setItem("routes", JSON.stringify(routes));
+      updateRouteList();
+    }
+
+    function updateRouteList() {
+      const container = document.getElementById("routeList");
+      container.innerHTML = "";
+      const routes = JSON.parse(localStorage.getItem("routes")) || [];
+
+      routes.forEach((route, index) => {
+        const item = document.createElement("div");
+        item.className = "memoItem";
+        let totalDistance = 0;
+        for (let i = 1; i < route.points.length; i++) {
+          const p1 = new google.maps.LatLng(route.points[i - 1]);
+          const p2 = new google.maps.LatLng(route.points[i]);
+          totalDistance += google.maps.geometry.spherical.computeDistanceBetween(p1, p2);
+        }
+        const distanceKm = (totalDistance / 1000).toFixed(2);
+        item.innerHTML = `
+        <strong>ルート:</strong> ${route.name}<br>
+        <strong>説明:</strong> ${route.description}<br>
+        <strong>距離:</strong> ${distanceKm} km<br>
+        <button onclick="showRoute(${index})">表示</button>
+        <button onclick="hideRoute(${index})">非表示</button>
+        <button onclick="deleteRoute(${index})">削除</button>
+        <button onclick="showStreetView(${route.points[0].lat}, ${route.points[0].lng})">ストリートビュー</button>
+        `;
+        container.appendChild(item);
+      });
+    }
+
+    function showRouteList() {
+      document.getElementById("memoList").style.display = "none";
+      document.getElementById("memoTitle").style.display = "none";
+      document.getElementById("routeList").style.display = "block";
+      document.getElementById("routeTitle").style.display = "block";
+      updateRouteList(); 
+    }
+
+    function deleteRoute(index) {
+      const routes = JSON.parse(localStorage.getItem("routes")) || [];
+      routes.splice(index, 1);
+      localStorage.setItem("routes", JSON.stringify(routes));
+      if (displayedPolyline) {
+        displayedPolyline.setMap(null);
+        displayedPolyline = null;
+      }
+      updateRouteList();
+    }
+
+    function showStreetView(lat, lng) {
+      const panorama = new google.maps.StreetViewPanorama(document.getElementById("map"), {
+        position: { lat, lng },
+        pov: { heading: 165, pitch: 0 },
+        zoom: 1
+      });
+      map.setStreetView(panorama);
+      document.getElementById("exitStreetViewBtn").style.display = "inline-block";
+    }
+
+    function exitStreetView() {
+      const panorama = map.getStreetView();
+      panorama.setVisible(false);
+      document.getElementById("exitStreetViewBtn").style.display = "none";
+    }
+    
+    function showCategoryEditor() {
+        if (document.getElementById("categoryEditor")) return;
+
+        const container = document.createElement("div");
+        container.id = "categoryEditor";
+        container.innerHTML = `
+        <h3>カテゴリ編集</h3>
+        <ul>
+            ${categories.map(c => `
+            <li>
+                <input type="text" value="${c.name}" data-original="${c.name}" class="categoryInput">
+            </li>
+            `).join("")}
+            </ul>
+        <button onclick="saveCategoryChanges()">保存</button>
+        <button onclick="cancelCategoryEdit()">キャンセル</button>
+        `;
+        document.body.appendChild(container);
+
+        // 削除ボタンのイベント設定
+        container.querySelectorAll(".deleteCategoryBtn").forEach(btn => {
+            btn.onclick = () => {
+                btn.parentElement.remove();
+            };
+        });
+        
+        // 追加ボタンのイベント設定
+        document.getElementById("addCategoryBtn").onclick = () => {
+            const li = document.createElement("li");
+            li.innerHTML = `
+              <input type="text" value="" class="categoryInput">
+              <button class="deleteCategoryBtn">削除</button>
+            `;
+            document.getElementById("categoryList").appendChild(li);
+            li.querySelector(".deleteCategoryBtn").onclick = () => li.remove();
+        };
+    }
+
+    function saveCategoryChanges() {
+        const inputs = document.querySelectorAll(".categoryInput");
+        categories = Array.from(inputs)
+          .map(input => input.value.trim())
+          .filter(name => name !== "")
+          .map(name => ({ name }));
+
+        updateCategoryFilter(); 
+        document.getElementById("categoryEditor").remove();
+    }
+    
+    function cancelCategoryEdit() {
+        const editor = document.getElementById("categoryEditor");
+        if (editor) editor.remove();
+    }
+
+  </script>
+
+  <script async defer
+    src="https://maps.googleapis.com/maps/api/js?key=AIzaSyA1dLdCicwNQRYmAr8z5JR94m07K8gA0O4&callback=initMap&libraries=geometry">
+  </script>
+</body>
+</html>
